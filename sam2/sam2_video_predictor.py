@@ -987,12 +987,7 @@ class SAM2VideoPredictorVOS(SAM2VideoPredictor):
             dynamic=False,
         )
 
-        self.memory_attention.forward = torch.compile(
-            self.memory_attention.forward,
-            mode="max-autotune",
-            fullgraph=True,
-            dynamic=True,  # Num. of memories varies
-        )
+        self.memory_attention.forward = self.memory_attention.forward
 
         self.sam_prompt_encoder.forward = torch.compile(
             self.sam_prompt_encoder.forward,

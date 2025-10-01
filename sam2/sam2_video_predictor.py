@@ -83,6 +83,8 @@ class SAM2VideoPredictor(SAM2Base):
         inference_state["cached_features"] = {}
         # Cache prepared backbone features per (frame_idx, batch_size) to avoid recomputing
         inference_state["prepared_features_cache"] = {}
+        # Cache batched outputs per object chunk to amortize collation costs
+        inference_state["batched_chunk_cache"] = {}
         # values that don't change across frames (so we only need to hold one copy of them)
         inference_state["constants"] = {}
         # mapping between client-side object id and model-side object index
@@ -651,7 +653,16 @@ class SAM2VideoPredictor(SAM2Base):
             "valid_mask": valid_mask,
         }
 
+    def _invalidate_batched_chunk_cache(self, inference_state):
+        inference_state.get("batched_chunk_cache", {}).clear()
+
     def _build_batched_output_dict(self, inference_state, obj_indices):
+        cache = inference_state.setdefault("batched_chunk_cache", {})
+        chunk_key = tuple(obj_indices)
+        cached = cache.get(chunk_key)
+        if cached is not None:
+            return cached
+
         batched = {
             "cond_frame_outputs": {},
             "non_cond_frame_outputs": {},
@@ -670,6 +681,7 @@ class SAM2VideoPredictor(SAM2Base):
                 )
                 if collated is not None:
                     batched[storage_key][frame_idx] = collated
+        cache[chunk_key] = batched
         return batched
 
     def _add_output_per_object(
@@ -733,6 +745,7 @@ class SAM2VideoPredictor(SAM2Base):
 
         # Consolidate per-object temporary outputs in "temp_output_dict_per_obj" and
         # add them into "output_dict".
+        modified = False
         for obj_idx in range(batch_size):
             obj_output_dict = inference_state["output_dict_per_obj"][obj_idx]
             obj_temp_output_dict = inference_state["temp_output_dict_per_obj"][obj_idx]
@@ -766,6 +779,7 @@ class SAM2VideoPredictor(SAM2Base):
                         out["maskmem_pos_enc"] = maskmem_pos_enc
 
                     obj_output_dict[storage_key][frame_idx] = out
+                    modified = True
                     if self.clear_non_cond_mem_around_input:
                         # clear non-conditioning memory of the surrounding frames
                         self._clear_obj_non_cond_mem_around_input(
@@ -785,7 +799,12 @@ class SAM2VideoPredictor(SAM2Base):
             # edge case: if an output is added to "cond_frame_outputs", we remove any prior
             # output on the same frame in "non_cond_frame_outputs"
             for frame_idx in obj_output_dict["cond_frame_outputs"]:
-                obj_output_dict["non_cond_frame_outputs"].pop(frame_idx, None)
+                if frame_idx in obj_output_dict["non_cond_frame_outputs"]:
+                    obj_output_dict["non_cond_frame_outputs"].pop(frame_idx, None)
+                    modified = True
+
+        if modified:
+            self._invalidate_batched_chunk_cache(inference_state)
 
     @torch.inference_mode()
     def propagate_in_video(
@@ -945,6 +964,7 @@ class SAM2VideoPredictor(SAM2Base):
             inference_state["frames_tracked_per_obj"][obj_idx].pop(frame_idx, None)
 
         if not need_output:
+            self._invalidate_batched_chunk_cache(inference_state)
             return
         # Finally, output updated masks per object (after removing the inputs above)
         obj_ids = inference_state["obj_ids"]
@@ -961,6 +981,7 @@ class SAM2VideoPredictor(SAM2Base):
         _, video_res_masks = self._get_orig_video_res_output(
             inference_state, consolidated_out["pred_masks_video_res"]
         )
+        self._invalidate_batched_chunk_cache(inference_state)
         return frame_idx, obj_ids, video_res_masks
 
     @torch.inference_mode()
@@ -976,6 +997,7 @@ class SAM2VideoPredictor(SAM2Base):
         inference_state["output_dict_per_obj"].clear()
         inference_state["temp_output_dict_per_obj"].clear()
         inference_state["frames_tracked_per_obj"].clear()
+        inference_state.get("batched_chunk_cache", {}).clear()
 
     def _reset_tracking_results(self, inference_state):
         """Reset all tracking inputs and results across the videos."""
@@ -1267,6 +1289,7 @@ class SAM2VideoPredictor(SAM2Base):
                 )
                 updated_frames.append((frame_idx, video_res_masks))
 
+        self._invalidate_batched_chunk_cache(inference_state)
         return inference_state["obj_ids"], updated_frames
 
     def _clear_non_cond_mem_around_input(self, inference_state, frame_idx):

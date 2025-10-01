@@ -7,13 +7,12 @@
 import torch
 import torch.distributed
 import torch.nn.functional as F
-
 from torch.nn.init import trunc_normal_
 
+from sam2.modeling.sam2_utils import MLP, get_1d_sine_pe, select_closest_cond_frames
 from sam2.modeling.sam.mask_decoder import MaskDecoder
 from sam2.modeling.sam.prompt_encoder import PromptEncoder
 from sam2.modeling.sam.transformer import TwoWayTransformer
-from sam2.modeling.sam2_utils import get_1d_sine_pe, MLP, select_closest_cond_frames
 
 # a large negative value as a placeholder score for missing objects
 NO_OBJ_SCORE = -1024.0
@@ -156,6 +155,22 @@ class SAM2Base(torch.nn.Module):
         self.multimask_output_for_tracking = multimask_output_for_tracking
         self.use_multimask_token_for_obj_ptr = use_multimask_token_for_obj_ptr
         self.iou_prediction_use_sigmoid = iou_prediction_use_sigmoid
+
+        if hasattr(torch, "set_float32_matmul_precision"):
+            torch.set_float32_matmul_precision("high")
+        if torch.cuda.is_available():
+            try:
+                torch.backends.cuda.matmul.allow_tf32 = True
+            except AttributeError:
+                pass
+            try:
+                torch.backends.cudnn.allow_tf32 = True
+            except AttributeError:
+                pass
+            try:
+                torch.backends.cudnn.benchmark = True
+            except AttributeError:
+                pass
 
         # Part 4: SAM-style prompt encoder (for both mask and point inputs)
         # and SAM-style mask decoder for the final mask output
@@ -617,7 +632,17 @@ class SAM2Base(torch.nn.Module):
                         t, unselected_cond_outputs.get(t, None)
                     )
                     if out is not None:
-                        pos_and_ptrs.append((t_diff, out["obj_ptr"]))
+                        # Filter out objects with logits == -1
+                        logits = out.get("object_score_logits", None)
+                        skip = False
+                        if logits is not None:
+                            if isinstance(logits, torch.Tensor):
+                                if torch.all(logits == -1.0):
+                                    skip = True
+                            elif logits == -1.0:
+                                skip = True
+                        if not skip:
+                            pos_and_ptrs.append((t_diff, out["obj_ptr"]))
                 # If we have at least one object pointer, add them to the across attention
                 if len(pos_and_ptrs) > 0:
                     pos_list, ptrs_list = zip(*pos_and_ptrs)
